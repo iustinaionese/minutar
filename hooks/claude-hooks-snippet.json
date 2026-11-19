@@ -1,0 +1,22 @@
+{
+  "_comment": "Reference snippet: the Claude Code hooks Minutar uses. hooks/install-claude-hooks.mjs merges them into ~/.claude/settings.json (user scope, applies to every project) and keeps a timestamped backup. Events fire-and-forget the raw hook JSON to the daemon; hook_event_name distinguishes them. UserPromptSubmit/Notification also mark the session as last-interacted for the attention metric.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl.exe -s --max-time 2 -X POST -H \"Content-Type: application/json\" --data-binary @- http://127.0.0.1:5601/claude/event",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionStart": "same command",
+    "UserPromptSubmit": "same command",
+    "Stop": "same command",
+    "SessionEnd": "same command",
+    "Notification": "same command"
+  }
+}

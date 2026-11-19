@@ -1,0 +1,608 @@
+using Tomlyn;
+using Tomlyn.Model;
+
+namespace Tracker.Shared.Config;
+
+/// <summary>
+/// Strongly-typed model of config/tracker.toml — the single source of truth (locked decision #9).
+/// TOML keys are snake_case; properties map via <see cref="TomlOptions"/>.
+/// </summary>
+public sealed class TrackerConfig
+{
+    public ServerConfig Server { get; set; } = new();
+    public StorageConfig Storage { get; set; } = new();
+    public AfkConfig Afk { get; set; } = new();
+    public WindowConfig Window { get; set; } = new();
+    public BrowserConfig Browser { get; set; } = new();
+    public ClaudeConfig Claude { get; set; } = new();
+    public PopupConfig Popup { get; set; } = new();
+    public VideoConfig Video { get; set; } = new();
+    public AttributionConfig Attribution { get; set; } = new();
+    public List<ProjectConfig> Projects { get; set; } = new();
+    public List<AssignmentConfig> Assignments { get; set; } = new();
+    public List<PhoneAppConfig> PhoneApps { get; set; } = new();
+    public ClassificationConfig Classification { get; set; } = new();
+    public YoutubeExceptionsConfig YoutubeExceptions { get; set; } = new();
+    public SupervisorConfig Supervisor { get; set; } = new();
+    public GoalsConfig Goals { get; set; } = new();
+    public FocusConfig Focus { get; set; } = new();
+    public ProfileConfig Profile { get; set; } = new();
+    public CoachConfig Coach { get; set; } = new();
+    public TelegramConfig Telegram { get; set; } = new();
+    public MeetingsConfig Meetings { get; set; } = new();
+    public CalendarConfig Calendar { get; set; } = new();
+
+    public static TrackerConfig Load(string path)
+    {
+        var text = File.ReadAllText(path);
+        var cfg = Toml.ToModel<TrackerConfig>(text, path, TomlOptions.Default);
+        cfg.Validate();
+        return cfg;
+    }
+
+    /// <summary>
+    /// Rejects values that would busy-loop or crash the capture loops when hot-reloaded
+    /// (tournament review finding). ConfigProvider keeps the last GOOD config on throw.
+    /// Public so the settings API can validate BEFORE writing the file.
+    /// </summary>
+    public void Validate()
+    {
+        Require(Server.BridgePort is >= 1 and <= 65535, "server.bridge_port must be 1-65535");
+        foreach (var a in Assignments)
+        {
+            Require(a.Match is "app" or "domain", "assignments.match must be app|domain");
+            Require(!string.IsNullOrWhiteSpace(a.Value), "assignments need a value");
+            Require(!string.IsNullOrWhiteSpace(a.Project) || !string.IsNullOrWhiteSpace(a.Class),
+                "assignments need a project and/or a class");
+            Require(a.Class is "" or "productive" or "neutral" or "unproductive",
+                "assignments.class must be productive|neutral|unproductive");
+            Require(DateOnly.TryParseExact(a.Date, "yyyy-MM-dd", out _), "assignments.date must be yyyy-MM-dd");
+            Require(a.From.Length == 0 == (a.To.Length == 0), "assignments need both from and to, or neither");
+            if (a.HasInterval)
+            {
+                // HH:mm:ss e emis de alocarea „pe minute" (tăietura cade rar fix pe minut)
+                var formats = new[] { "HH:mm", "HH:mm:ss" };
+                var fOk = TimeOnly.TryParseExact(a.From, formats, out var f);
+                var tOk = TimeOnly.TryParseExact(a.To, formats, out var t);
+                Require(fOk && tOk, "assignments.from/to must be HH:mm[:ss]");
+                Require(f < t, "assignments.from must be before to");
+            }
+        }
+        // intervals on the same target+day must not overlap (which one wins would be ambiguous)
+        foreach (var g in Assignments.Where(a => a.HasInterval)
+                     .GroupBy(a => (a.Date, a.Match, Value: a.Value.ToLowerInvariant())))
+        {
+            var sorted = g.OrderBy(a => a.From, StringComparer.Ordinal).ToList();
+            for (var i = 1; i < sorted.Count; i++)
+                Require(string.CompareOrdinal(sorted[i].From, sorted[i - 1].To) >= 0,
+                    $"assignments intervals overlap for {g.Key.Value} on {g.Key.Date}");
+        }
+        Require(Afk.PollSeconds >= 1, "afk.poll_seconds must be >= 1");
+        Require(Afk.TimeoutSeconds >= 10, "afk.timeout_seconds must be >= 10");
+        Require(Window.PollSeconds >= 1, "window.poll_seconds must be >= 1");
+        Require(Window.PulsetimeSeconds > Window.PollSeconds, "window.pulsetime_seconds must exceed window.poll_seconds");
+        Require(Browser.HeartbeatSeconds >= 5, "browser.heartbeat_seconds must be >= 5");
+        Require(Browser.PulsetimeSeconds > Browser.HeartbeatSeconds, "browser.pulsetime_seconds must exceed browser.heartbeat_seconds");
+        Require(Claude.WorkPulsetimeSeconds >= 30, "claude.work_pulsetime_seconds must be >= 30");
+        Require(Claude.AttentionPulsetimeSeconds >= 5, "claude.attention_pulsetime_seconds must be >= 5");
+        Require(Popup.GraceSeconds >= 5, "popup.grace_seconds must be >= 5");
+        Require(Popup.PostponeOptionsMinutes.All(m => m >= 1), "popup.postpone_options_minutes must all be >= 1");
+        Require(Popup.RenagMinutesDefault >= 1, "popup.renag_minutes_default must be >= 1");
+        Require(Popup.DismissMinutes >= 1, "popup.dismiss_minutes must be >= 1");
+        foreach (var p in PhoneApps)
+        {
+            Require(p.Name.Trim().Length > 0, "phone_apps.name nu poate fi gol");
+            Require(p.Class is "productive" or "neutral" or "unproductive",
+                $"phone_apps.class invalid pentru „{p.Name}”: {p.Class}");
+            Require(p.Kind is "" or "app" or "site" or "browser",
+                $"phone_apps.kind invalid pentru „{p.Name}”: {p.Kind}");
+        }
+        Require(Popup.SureCooldownMinutes >= 1, "popup.sure_cooldown_minutes must be >= 1");
+        Require(Attribution.HoldSeconds >= 0, "attribution.hold_seconds must be >= 0");
+        Require(Supervisor.CheckSeconds >= 5, "supervisor.check_seconds must be >= 5");
+        Require(Goals.StreakProductiveMinutes >= 1, "goals.streak_productive_minutes must be >= 1");
+        Require(Coach.MinMinutesBetweenNudges >= 5, "coach.min_minutes_between_nudges must be >= 5");
+        Require(Coach.RuleCooldownMinutes >= 10, "coach.rule_cooldown_minutes must be >= 10");
+        Require(Coach.FlowMinutes >= 5, "coach.flow_minutes must be >= 5");
+        Require(Coach.ToastSeconds is >= 5 and <= 60, "coach.toast_seconds must be 5-60");
+        Require(Coach.UnproductiveMinutes >= 3, "coach.unproductive_minutes must be >= 3");
+        Require(Coach.MaxSwitchesPerHour >= 10, "coach.max_switches_per_hour must be >= 10");
+        Require(Coach.NoBreakHours >= 0.5, "coach.no_break_hours must be >= 0.5");
+        Require(Coach.DeadlineDriftDays >= 1, "coach.deadline_drift_days must be >= 1");
+        Require(Focus.GraceSeconds >= 1, "focus.grace_seconds must be >= 1");
+        Require(Focus.CountdownSeconds >= 3, "focus.countdown_seconds must be >= 3");
+        Require(Focus.DefaultMinutes >= 1, "focus.default_minutes must be >= 1");
+        // Token-ul/chat-ul lipsă NU sunt eroare de validare intenționat: pe hot-reload o excepție
+        // aici ar păstra tăcut configul vechi (ConfigProvider), iar tu ai crede că ai salvat.
+        // Lipsa lor se tratează la rulare, cu un mesaj în log.
+        Require(Telegram.BriefingDelaySeconds >= 0, "telegram.briefing_delay_seconds must be >= 0");
+        Require(Telegram.EarliestHour is >= 0 and <= 23, "telegram.earliest_hour must be 0-23");
+        Require(Meetings.BridgeMinutes >= 1, "meetings.bridge_minutes must be >= 1");
+        // Calea cheii și adresa calendarului lipsă NU sunt eroare, din același motiv ca la telegram.
+        Require(Calendar.MaxAgendaItems >= 1, "calendar.max_agenda_items must be >= 1");
+        Require(Calendar.TimeoutSeconds >= 1, "calendar.timeout_seconds must be >= 1");
+        // sub două mutări n-ai ce numi amânare — ai mutat ceva o dată, se întâmplă
+        Require(Calendar.RescheduleMoves >= 2, "calendar.reschedule_moves must be >= 2");
+        Require(Calendar.RescheduleWindowDays >= 1, "calendar.reschedule_window_days must be >= 1");
+
+        static void Require(bool ok, string message)
+        {
+            if (!ok) throw new InvalidDataException("tracker.toml invalid: " + message);
+        }
+    }
+}
+
+public sealed class ServerConfig
+{
+    public string AwUrl { get; set; } = "http://localhost:5600";
+    public int BridgePort { get; set; } = 5601;
+    public string BucketHost { get; set; } = "";
+
+    /// <summary>Suffix for bucket IDs; falls back to the machine name when unset.</summary>
+    public string ResolveBucketHost() =>
+        string.IsNullOrWhiteSpace(BucketHost) ? Environment.MachineName : BucketHost;
+}
+
+/// <summary>
+/// Own event storage (plan docs/PLAN-2026-07-10-remove-activitywatch.md). STARTUP-ONLY:
+/// the daemon opens the DB and binds Kestrel once — hot-reload deliberately ignores
+/// these keys (a config edit takes effect at the next daemon restart).
+/// </summary>
+public sealed class StorageConfig
+{
+    /// <summary>Empty = %LOCALAPPDATA%\TimeTracker\events.db. Override for dev instances (--db beats both).</summary>
+    public string DbPath { get; set; } = "";
+
+    /// <summary>
+    /// Parity-gate tee (temporary, plan M4): when set to the real aw-server URL, /api/0
+    /// writes are applied locally AND forwarded to aw-server, while reads are proxied to
+    /// aw-server (it stays the source of truth until cutover). Empty = standalone mode.
+    /// </summary>
+    public string TeeAwUrl { get; set; } = "";
+
+    /// <summary>Resolved database path (config or default), before any --db CLI override.</summary>
+    public string ResolveDbPath() => string.IsNullOrWhiteSpace(DbPath)
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TimeTracker", "events.db")
+        : DbPath;
+}
+
+public sealed class AfkConfig
+{
+    public int TimeoutSeconds { get; set; } = 180;
+    public int PollSeconds { get; set; } = 5;
+}
+
+public sealed class WindowConfig
+{
+    public int PollSeconds { get; set; } = 1;
+    public int PulsetimeSeconds { get; set; } = 5;
+}
+
+public sealed class BrowserConfig
+{
+    public int HeartbeatSeconds { get; set; } = 60;
+    public int PulsetimeSeconds { get; set; } = 80;
+    public List<string> Processes { get; set; } = new() { "chrome.exe", "msedge.exe" };
+}
+
+public sealed class ClaudeConfig
+{
+    public string ProjectsDir { get; set; } = "";
+    public List<string> DesktopProcesses { get; set; } = new() { "Claude.exe" };
+    public int WorkPulsetimeSeconds { get; set; } = 150;
+    public int AttentionPulsetimeSeconds { get; set; } = 15;
+    public bool JsonlFallback { get; set; } = true;
+}
+
+public sealed class PopupConfig
+{
+    public int GraceSeconds { get; set; } = 30;
+    public List<int> PostponeOptionsMinutes { get; set; } = new() { 5, 10, 30 };
+    public int RenagMinutesDefault { get; set; } = 10;
+
+    /// <summary>The "X" in the corner: read it, close it, no commitment. It still needs a
+    /// floor — with zero the popup would come back on the next tick, a second later — so
+    /// this is the shortest silence that makes closing meaningful.</summary>
+    public int DismissMinutes { get; set; } = 2;
+    public int SureCooldownMinutes { get; set; } = 60;
+    public List<string> QuietHours { get; set; } = new();
+}
+
+public sealed class VideoConfig
+{
+    public bool AudibleFocusedCountsActive { get; set; } = true;
+}
+
+public sealed class AttributionConfig
+{
+    public int HoldSeconds { get; set; } = 20;
+}
+
+/// <summary>
+/// Cum se contorizează o aplicație de pe telefon. Numele vin din Screen Time („WhatsApp",
+/// „MemeBox") și NU se potrivesc cu regulile de pe PC, care lucrează cu procese
+/// („WhatsApp.Root.exe") și domenii („memebox.example") — de aceea au lista lor, completată o
+/// singură dată pe aplicație, la importul în care apare prima oară.
+/// </summary>
+public sealed class PhoneAppConfig
+{
+    public string Name { get; set; } = "";
+    public string Class { get; set; } = "neutral";
+
+    /// <summary>Opțional: timpul acelei aplicații se atribuie unui proiect.</summary>
+    public string Project { get; set; } = "";
+
+    /// <summary>
+    /// Ce fel de intrare e: <c>app</c>, <c>site</c> sau <c>browser</c>. Gol = ghicim
+    /// (are punct și n-are spațiu ⇒ site; nume de browser cunoscut ⇒ browser).
+    ///
+    /// <c>browser</c> înseamnă RECIPIENT, nu activitate: Screen Time raportează Safari și
+    /// site-urile din el ca intrări separate în aceeași listă, deși timpul e același:
+    /// timpul browserului e aproape exact suma site-urilor de sub el. Numărat ca
+    /// activitate, dubla tot ce ai navigat și punea totul pe clasa browserului. E aceeași
+    /// regulă ca pe calculator, unde o fereastră de browser se clasifică după site, nu
+    /// după chrome.exe.
+    /// </summary>
+    public string Kind { get; set; } = "";
+}
+
+public sealed class ProjectConfig
+{
+    public string Name { get; set; } = "";
+    public List<string> Keywords { get; set; } = new();
+    public List<string> ClaudeDirs { get; set; } = new();
+
+    /// <summary>
+    /// Decision #12: extension profile labels and/or AppUserModelID fragments.
+    /// For browser windows a profile match beats keyword attribution.
+    /// </summary>
+    public List<string> BrowserProfiles { get; set; } = new();
+
+    /// <summary>Explicit exe names pinned to this project — beat profile AND keywords.</summary>
+    public List<string> Apps { get; set; } = new();
+
+    /// <summary>Explicit domains pinned to this project — beat profile AND keywords.</summary>
+    public List<string> Domains { get; set; } = new();
+}
+
+public sealed class ClassificationConfig
+{
+    public string Default { get; set; } = "neutral";
+    public List<ClassificationRule> Rules { get; set; } = new();
+}
+
+/// <summary>
+/// One per-day project assignment ("Zoom on 2026-07-10 → ClientX"): overrides every
+/// attribution rule, but ONLY for that calendar day (local time). Written by the
+/// dashboard's "doar ziua asta" option; reports apply it retroactively like everything else.
+/// </summary>
+public sealed class AssignmentConfig
+{
+    /// <summary>Local calendar day, yyyy-MM-dd.</summary>
+    public string Date { get; set; } = "";
+
+    /// <summary>app | domain</summary>
+    public string Match { get; set; } = "app";
+
+    public string Value { get; set; } = "";
+
+    /// <summary>Empty = no project override for that day.</summary>
+    public string Project { get; set; } = "";
+
+    /// <summary>Empty = no class override; else productive|neutral|unproductive, that day only
+    /// (ex. WhatsApp e neproductiv ca regulă, dar pe ziua cu clientul devine productiv).</summary>
+    public string Class { get; set; } = "";
+
+    /// <summary>Optional interval start, local "HH:mm". Empty = the whole day. With an interval
+    /// set, the override applies only inside [from, to) — an interval beats a whole-day entry
+    /// for the same day ("Zoom 14:00-15:30 → ClientX", restul zilei rămâne unde era).</summary>
+    public string From { get; set; } = "";
+
+    /// <summary>Optional interval end, local "HH:mm"; required when from is set.</summary>
+    public string To { get; set; } = "";
+
+    /// <summary>True when this entry targets a time interval instead of the whole day.</summary>
+    public bool HasInterval => From.Length > 0;
+}
+
+public sealed class ClassificationRule
+{
+    /// <summary>productive | neutral | unproductive</summary>
+    public string Class { get; set; } = "neutral";
+
+    /// <summary>domain | app | title</summary>
+    public string Match { get; set; } = "title";
+
+    public string Value { get; set; } = "";
+}
+
+public sealed class YoutubeExceptionsConfig
+{
+    public List<string> TitleKeywords { get; set; } = new();
+    public List<string> Channels { get; set; } = new();
+}
+
+public sealed class FocusConfig
+{
+    /// <summary>Grace before the countdown popup during focus mode (vs popup.grace_seconds normally).</summary>
+    public int GraceSeconds { get; set; } = 5;
+
+    /// <summary>Cancellable countdown shown before an unproductive APP is closed.</summary>
+    public int CountdownSeconds { get; set; } = 10;
+
+    public bool CloseApps { get; set; } = true;
+
+    /// <summary>During focus, the extension closes tabs on unproductive domains instantly.</summary>
+    public bool CloseTabs { get; set; } = true;
+
+    public int DefaultMinutes { get; set; } = 25;
+
+    /// <summary>Never force-closed, whatever the rules say.</summary>
+    public List<string> NeverClose { get; set; } = new()
+    {
+        "explorer.exe", "claude.exe", "chrome.exe", "msedge.exe",
+        "Tracker.Daemon.exe", "Tracker.Watcher.exe", "Tracker.Supervisor.exe", "aw-server.exe",
+    };
+}
+
+/// <summary>My Profile (Coach v0): who the user is and how they want to be coached.</summary>
+public sealed class ProfileConfig
+{
+    /// <summary>"De ce muncesc" — woven into coach messages.</summary>
+    public string Why { get; set; } = "";
+
+    /// <summary>coach | direct | funny | calm | data_driven (one or more).</summary>
+    public List<string> MotivationStyles { get; set; } = new() { "coach" };
+
+    /// <summary>Things the coach must never do (used by the LLM layer in v1).</summary>
+    public List<string> Dislikes { get; set; } = new();
+
+    public string WorkStart { get; set; } = "09:00";
+    public string WorkEnd { get; set; } = "18:00";
+    public string Lunch { get; set; } = "13:00-14:00";
+    public bool WorkWeekends { get; set; } = false;
+
+    /// <summary>e.g. ["09:00-11:00", "14:00-16:00"] — no nudges here while productive.</summary>
+    public List<string> FocusIntervals { get; set; } = new();
+
+    public List<GoalItem> ObjectiveList { get; set; } = new();
+}
+
+public sealed class GoalItem
+{
+    public string Title { get; set; } = "";
+
+    /// <summary>personal | professional</summary>
+    public string Kind { get; set; } = "professional";
+
+    /// <summary>yyyy-MM-dd, empty = no deadline.</summary>
+    public string Deadline { get; set; } = "";
+
+    /// <summary>Optional link to a tracker project (deadline-drift rule).</summary>
+    public string Project { get; set; } = "";
+}
+
+/// <summary>Coach v0 rule thresholds — all local, no LLM.</summary>
+public sealed class CoachConfig
+{
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Global anti-spam: minimum minutes between any two nudges.</summary>
+    public int MinMinutesBetweenNudges { get; set; } = 20;
+
+    /// <summary>Per-rule cooldown (same rule won't re-fire sooner).</summary>
+    public int RuleCooldownMinutes { get; set; } = 90;
+
+    /// <summary>≥ N continuous productive minutes on one project = Flow → total silence.</summary>
+    public int FlowMinutes { get; set; } = 20;
+
+    /// <summary>Toast auto-dismiss.</summary>
+    public int ToastSeconds { get; set; } = 12;
+
+    // rule thresholds
+    public bool RuleUnproductive { get; set; } = true;
+    public int UnproductiveMinutes { get; set; } = 15;
+
+    public bool RuleContextSwitching { get; set; } = true;
+    public int MaxSwitchesPerHour { get; set; } = 120;
+
+    public bool RuleMainNotStarted { get; set; } = true;
+    public string MainProjectCheckAt { get; set; } = "12:00";
+
+    public bool RuleNoBreak { get; set; } = true;
+    public double NoBreakHours { get; set; } = 2.0;
+
+    public bool RuleDeadlineDrift { get; set; } = true;
+    public int DeadlineDriftDays { get; set; } = 7;
+}
+
+public sealed class GoalsConfig
+{
+    /// <summary>A day counts toward the streak when it has at least this many PRODUCTIVE minutes.</summary>
+    public int StreakProductiveMinutes { get; set; } = 60;
+}
+
+public sealed class SupervisorConfig
+{
+    /// <summary>Empty = %LOCALAPPDATA%\Programs\ActivityWatch\aw-server\aw-server.exe</summary>
+    public string AwServerExe { get; set; } = "";
+
+    /// <summary>Empty = auto-resolve (published sibling dir, then dev bin path).</summary>
+    public string WatcherExe { get; set; } = "";
+    public string DaemonExe { get; set; } = "";
+
+    public int CheckSeconds { get; set; } = 10;
+}
+
+/// <summary>
+/// Botul personal de Telegram. Token-ul stă doar în tracker.toml din %LOCALAPPDATA% — nu în repo,
+/// și nu e expus de GET /api/config.
+/// </summary>
+public sealed class TelegramConfig
+{
+    /// <summary>Comutatorul principal. Implicit oprit: fără token nu are ce trimite.</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>Token-ul primit de la @BotFather.</summary>
+    public string BotToken { get; set; } = "";
+
+    /// <summary>Id-ul conversației private cu botul (numeric).</summary>
+    public string ChatId { get; set; } = "";
+
+    /// <summary>Briefingul de ieri, o singură dată pe zi, la pornirea daemonului.</summary>
+    public bool DailyBriefing { get; set; } = true;
+
+    /// <summary>Rezumatul săptămânii încheiate, o singură dată per săptămână.</summary>
+    public bool WeeklyBriefing { get; set; } = true;
+
+    /// <summary>Rezumatul lunii încheiate, o singură dată per lună.</summary>
+    public bool MonthlyBriefing { get; set; } = true;
+
+    /// <summary>Sumarul perioadei, trimis în momentul în care imporți Screen Time.</summary>
+    public bool PhoneImportBriefing { get; set; } = true;
+
+    /// <summary>Răgaz după pornire: bucket-urile se așază, iar rețeaua de după login vine târziu.</summary>
+    public int BriefingDelaySeconds { get; set; } = 25;
+
+    /// <summary>
+    /// Ora de la care are voie să plece un briefing (0 = oricând).
+    ///
+    /// „La pornire" e un înlocuitor pentru „când te așezi la birou". O repornire venită dintr-o
+    /// instalare sau o actualizare la miezul nopții nu e asta: mesajul pleacă la o oră la care
+    /// dormi ȘI consumă ziua, deci dimineața nu mai primești nimic. Sub ora asta se așteaptă.
+    ///
+    /// Nu e o programare la oră fixă — e o podea. Dacă te așezi la birou la 9, îl primești la 9.
+    /// </summary>
+    public int EarliestHour { get; set; } = 7;
+}
+
+/// <summary>
+/// Detectarea ședințelor video. „Timp în ședință" și „timp cu Zoom în față" sunt întrebări
+/// diferite: cât partajezi un document, fereastra din față e browserul, deși ești tot în apel.
+/// Secțiunea asta spune cum se recunoaște un apel ÎN CURS, ca să nu numărăm drept ședință o
+/// aplicație doar pornită.
+/// </summary>
+public sealed class MeetingsConfig
+{
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Procesele care pot găzdui un apel.</summary>
+    public List<string> Apps { get; set; } = new() { "Zoom.exe", "Teams.exe", "ms-teams.exe" };
+
+    /// <summary>
+    /// Fragmente de titlu care arată un apel ÎN CURS. Aplicațiile de apel scriu altceva în titlu
+    /// într-un apel față de când sunt doar deschise — fără distincția asta,
+    /// o aplicație lăsată pornită toată ziua ar produce o ședință de opt ore.
+    /// </summary>
+    public List<string> InCallTitles { get; set; } = new()
+    {
+        "Meeting", "meeting controls", "Screen sharing", "Şedinţă", "Ședință", "Call",
+    };
+
+    /// <summary>Domenii care înseamnă apel în browser (Meet, Whereby și altele).</summary>
+    public List<string> Domains { get; set; } = new() { "meet.google.com", "whereby.com" };
+
+    /// <summary>
+    /// Cât timp poate lipsi semnalul fără ca ședința să se rupă în două. Acoperă exact cazul
+    /// „am partajat o foaie de calcul 20 de minute": fereastra apelului nu mai e în față, dar
+    /// apelul continuă.
+    /// </summary>
+    public int BridgeMinutes { get; set; } = 25;
+
+    /// <summary>Blocurile mai scurte de atât nu sunt ședințe — sunt clickuri rătăcite.</summary>
+    public int MinMinutes { get; set; } = 3;
+}
+
+/// <summary>
+/// Google Calendar, citit printr-un cont de serviciu. Contul de serviciu e o identitate
+/// separată: nu moștenește nimic de la contul care l-a creat, ci vede exact calendarele care
+/// i-au fost partajate explicit, cu drept de citire. Alternativa („login cu Google") cere un
+/// flux prin browser și tokenuri de reîmprospătat, iar pe status „Testing" tokenul moare la
+/// 7 zile — cod care se strică tăcut peste luni.
+///
+/// Calea cheii și adresa calendarului stau doar în tracker.toml din %LOCALAPPDATA%, ca
+/// tokenul de Telegram: nu în repo, și neexpuse de GET /api/config.
+/// </summary>
+public sealed class CalendarConfig
+{
+    /// <summary>Comutatorul principal. Implicit oprit: fără cheie nu are ce citi.</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>Calea către JSON-ul contului de serviciu.</summary>
+    public string KeyFile { get; set; } = "";
+
+    /// <summary>Adresa calendarului partajat cu contul de serviciu.</summary>
+    public string CalendarId { get; set; } = "";
+
+    /// <summary>
+    /// Dacă agenda pleacă spre Telegram cu titluri întregi. Titlurile conțin nume de clienți și
+    /// adrese, iar un chat cu bot nu e criptat cap-la-cap — oprește-l și primești doar orele.
+    /// </summary>
+    public bool AgendaInBriefing { get; set; } = true;
+
+    /// <summary>
+    /// Gazde care înseamnă apel video. Semnalul stă în câmpul „locație", nu în invitați: uneltele
+    /// de rezervare pun linkul de apel acolo și nu adaugă niciun invitat, așa că o integrare care
+    /// se ia după lista de participanți ratează exact ședințele de lucru.
+    /// Din link se păstrează DOAR gazda — restul URL-ului conține id-ul ședinței.
+    /// </summary>
+    public List<string> MeetingHosts { get; set; } = new()
+    {
+        "zoom.us", "meet.google.com", "teams.microsoft.com", "teams.live.com",
+        "whereby.com", "webex.com", "gotomeeting.com", "skype.com",
+    };
+
+    /// <summary>
+    /// Plasa de siguranță pentru ședințele scrise de mână, care n-au nici link, nici invitați —
+    /// doar un titlu. Fără ea, ședințele trecute în calendar „din cap" nu s-ar vedea deloc.
+    /// </summary>
+    public List<string> MeetingTitleKeywords { get; set; } = new()
+    {
+        "call", "meeting", "ședință", "sedinta", "sync", "standup", "interview",
+        "zoom", "meet", "apel", "discuție", "discutie",
+    };
+
+    /// <summary>Câte intrări intră în agenda zilei, ca mesajul să rămână citibil pe telefon.</summary>
+    public int MaxAgendaItems { get; set; } = 12;
+
+    /// <summary>„Ai mutat asta de trei ori" — singura parte care se uită la ce faci cu planul.</summary>
+    public bool RescheduleAlerts { get; set; } = true;
+
+    /// <summary>De câte mutări înainte e nevoie ca un eveniment să merite pomenit.</summary>
+    public int RescheduleMoves { get; set; } = 3;
+
+    /// <summary>Cât de departe în viitor se caută evenimente de urmărit.</summary>
+    public int RescheduleWindowDays { get; set; } = 45;
+
+    /// <summary>Google răspunde în sub o secundă; peste atât, briefingul pleacă fără agendă.</summary>
+    public int TimeoutSeconds { get; set; } = 15;
+}
+
+internal static class TomlOptions
+{
+    public static TomlModelOptions Default => new()
+    {
+        ConvertPropertyName = ToSnakeCase,
+        ConvertFieldName = ToSnakeCase,
+        IgnoreMissingProperties = true,
+    };
+
+    private static string ToSnakeCase(string name)
+    {
+        var sb = new System.Text.StringBuilder(name.Length + 4);
+        for (var i = 0; i < name.Length; i++)
+        {
+            var c = name[i];
+            if (char.IsUpper(c))
+            {
+                if (i > 0) sb.Append('_');
+                sb.Append(char.ToLowerInvariant(c));
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+        return sb.ToString();
+    }
+}
